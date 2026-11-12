@@ -1,0 +1,9 @@
+# build output
+/geosentinel
+/bin/
+*.test
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+# local fuzz cache is regenerated; failing inputs under testdata/fuzz ARE kept on purpose
