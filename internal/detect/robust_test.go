@@ -7,6 +7,7 @@ import (
 
 	"github.com/samyukthasyamsundar/geo-sentinel/internal/geo"
 	"github.com/samyukthasyamsundar/geo-sentinel/internal/sim"
+	"github.com/samyukthasyamsundar/geo-sentinel/internal/trace"
 )
 
 // TestRobustnessToUnseenConditions checks that the low false-alarm rate is not an artefact of tuning
@@ -58,23 +59,42 @@ func TestRobustnessToUnseenConditions(t *testing.T) {
 // Real receivers occasionally emit a single wild fix (multipath in an urban canyon, a cold-start
 // position) while the user keeps moving normally. This measures what one such glitch does.
 func TestSingleGlitchSpikeBehaviour(t *testing.T) {
+	// Policy: ONE isolated bad fix that immediately corrects itself is what a receiver glitch looks
+	// like, so it never changes the verdict by itself, whatever its size up to MaxGlitchM. It is still
+	// REPORTED (low confidence) for sizes the receiver could not plausibly produce as noise. What
+	// escalates the verdict is repetition (see TestSpikeDowngradeIsNotALoophole) or a size beyond
+	// MaxGlitchM, which no single-fix error reaches.
 	for _, tc := range []struct {
-		name    string
-		offsetM float64
-		wantMin Verdict // the least severe verdict that is acceptable; a glitch should not be "clean" if huge
-		wantMax Verdict
+		name       string
+		offsetM    float64
+		wantReport bool // must produce a lone-outlier finding
+		want       Verdict
 	}{
-		{"60 m glitch (ordinary urban multipath)", 60, Clean, Clean},
-		{"300 m glitch", 300, Clean, Suspicious},
-		{"5 km glitch (cold-start fix)", 5000, Suspicious, Spoofed},
+		{"60 m glitch (ordinary urban multipath)", 60, false, Clean},
+		{"150 m glitch", 150, false, Clean},
+		{"300 m glitch", 300, true, Clean},
+		{"5 km glitch (cold-start fix)", 5000, true, Clean},
+		{"90 km glitch", 90_000, true, Suspicious}, // beyond receiver glitches: the teleport check says so
 	} {
 		tr := sim.Honest(sim.Drive, 300, time.Second, 42)
-		i := 150
-		tr.Fixes[i].Point = glitch(tr.Fixes[i].Point, tc.offsetM)
-		got := Judge(Analyze(tr, All(DefaultConfig())))
-		fmt.Printf("%-42s -> %s\n", tc.name, got)
-		if rank(got) < rank(tc.wantMin) || rank(got) > rank(tc.wantMax) {
-			t.Errorf("%s: verdict %s outside [%s, %s]", tc.name, got, tc.wantMin, tc.wantMax)
+		tr.Fixes[150].Point = glitch(tr.Fixes[150].Point, tc.offsetM)
+		fs := Analyze(tr, All(DefaultConfig()))
+		got := Judge(fs)
+		reported := false
+		for _, f := range fs {
+			if f.Check == "speed" && f.Confidence == Low {
+				reported = true
+			}
+			if f.Check == "acceleration" {
+				t.Errorf("%s: a lone outlier must not also be reported as an acceleration: %s", tc.name, f.Reason)
+			}
+		}
+		fmt.Printf("%-42s -> %-10s reported=%v\n", tc.name, got, reported)
+		if got != tc.want {
+			t.Errorf("%s: verdict %s, want %s", tc.name, got, tc.want)
+		}
+		if tc.wantReport && !reported && tc.want == Clean {
+			t.Errorf("%s: a glitch this large should still be mentioned", tc.name)
 		}
 	}
 }
@@ -124,5 +144,43 @@ func TestSpikeDowngradeIsNotALoophole(t *testing.T) {
 	fmt.Printf("26 lone outliers in one trace -> %s\n", got)
 	if got == Clean {
 		t.Errorf("26 isolated outliers in one trace must not be clean")
+	}
+}
+
+// The outlier handling must not become a place for real anomalies to hide.
+func TestOutlierHandlingDoesNotHideRealSpeedChanges(t *testing.T) {
+	base := func() *trace.Trace { return sim.Honest(sim.Drive, 300, time.Second, 7) }
+
+	// 1) A SUSTAINED change to an impossible speed is not an outlier (the fixes after it stay changed),
+	//    so it must still be caught: a car that suddenly moves at 400 m/s for twenty seconds.
+	tr := base()
+	pos := tr.Fixes[100].Point
+	for i := 101; i < 121; i++ {
+		pos = geo.Destination(pos, 90, 400)
+		tr.Fixes[i].Point = pos
+	}
+	for i := 121; i < 300; i++ {
+		tr.Fixes[i].Point = geo.Destination(pos, 90, float64(i-120)*14) // resumes normal speed from the new place
+	}
+	if got := Judge(Analyze(tr, All(DefaultConfig()))); got != Spoofed {
+		t.Errorf("sustained 400 m/s: got %s, want likely-spoofed", got)
+	}
+
+	// 2) Every other fix displaced (a zig-zag): not a lone outlier, because the neighbours disagree with
+	//    each other's expectation. It must not be silently absorbed.
+	tr = base()
+	for i := 20; i < 280; i += 2 {
+		tr.Fixes[i].Point = geo.Destination(tr.Fixes[i].Point, 90, 600)
+	}
+	if got := Judge(Analyze(tr, All(DefaultConfig()))); got == Clean {
+		t.Errorf("a zig-zag of 130 displaced fixes was judged clean")
+	}
+
+	// 3) Two adjacent bad fixes are not an isolated outlier either.
+	tr = base()
+	tr.Fixes[150].Point = geo.Destination(tr.Fixes[150].Point, 90, 5000)
+	tr.Fixes[151].Point = geo.Destination(tr.Fixes[151].Point, 90, 5000)
+	if got := Judge(Analyze(tr, All(DefaultConfig()))); got == Clean {
+		t.Errorf("a two-fix excursion of 5 km was judged clean")
 	}
 }

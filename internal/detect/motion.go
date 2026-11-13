@@ -208,6 +208,60 @@ func (tp Teleport) Run(t *trace.Trace) []Finding {
 	return out
 }
 
+// ---- isolated outliers ----
+
+// isolatedOutliers marks fixes that are wrong on their own: far from where BOTH neighbours say the
+// device was, while those neighbours agree with each other. A single bad reading from the receiver
+// (multipath, a cold-start fix) looks like this; a relocation does not, because the fixes after it
+// stay at the new place and so do not agree with the ones before.
+//
+// "Far" is relative to the noise the device itself reported, with a floor, so ordinary jitter on a
+// noisy trace is never marked.
+func isolatedOutliers(t *trace.Trace, cfg Config) []bool {
+	n := len(t.Fixes)
+	out := make([]bool, n)
+	for i := 1; i+1 < n; i++ {
+		a, b, c := t.Fixes[i-1], t.Fixes[i], t.Fixes[i+1]
+		if b.Time.Sub(a.Time) < cfg.MinGapForSpeed || c.Time.Sub(b.Time) < cfg.MinGapForSpeed {
+			continue
+		}
+		if !returnsNear(t, i-1, i+1, cfg) {
+			continue // the neighbours disagree, so this is not a spike on an otherwise steady track
+		}
+		// How far b sits from the straight line a->c at b's moment in time.
+		span := c.Time.Sub(a.Time).Seconds()
+		frac := b.Time.Sub(a.Time).Seconds() / span
+		expectLat := a.Lat + (c.Lat-a.Lat)*frac
+		expectLon := a.Lon + (c.Lon-a.Lon)*frac
+		off := geo.DistanceM(b.Point, geo.Point{Lat: expectLat, Lon: expectLon})
+		// A real vehicle can swerve, so allow a generous lateral deviation before calling it an outlier:
+		// the reported noise of all three fixes, or 50 m, whichever is larger.
+		slack := math.Max(50, noise(a)+noise(b)+noise(c))
+		out[i] = off > slack
+	}
+	return out
+}
+
+func countTrue(b []bool) int {
+	n := 0
+	for _, v := range b {
+		if v {
+			n++
+		}
+	}
+	return n
+}
+
+// maxExcusedOutliers is how many isolated outliers a trace of n fixes may have before they stop being
+// treated as receiver glitches: 1% of the fixes, and at least 2 so a short trace is not penalised for a
+// single bad reading.
+func maxExcusedOutliers(n int) int {
+	if m := n / 100; m > 2 {
+		return m
+	}
+	return 2
+}
+
 // ---- Accel: speed changes no vehicle can make ----
 
 // Accel flags implausibly sudden changes of speed. A spoofer who moves a point at constant speed
@@ -231,8 +285,26 @@ func (a Accel) Run(t *trace.Trace) []Finding {
 	}
 	var segs []seg
 	var idx []int
-	for i := 1; i < len(t.Fixes); i++ {
-		prev, cur := t.Fixes[i-1], t.Fixes[i]
+	// One bad fix corrupts the speed into it and the speed out of it, and both then look like an
+	// acceleration. So build the speeds from the fixes that are NOT isolated outliers; the outlier is
+	// reported by the speed check, which is where it belongs.
+	bad := isolatedOutliers(t, a.Cfg)
+	// Excusing outliers is only safe when there are few of them. A receiver glitches rarely; a trace in
+	// which a sizeable share of fixes look like "isolated outliers" is not a trace with glitches, it is
+	// one where the positions have been tampered with, and quietly discarding them would hide that.
+	// Past the limit, stop excusing any of them and let the speed changes stand.
+	if countTrue(bad) > maxExcusedOutliers(len(t.Fixes)) {
+		bad = make([]bool, len(t.Fixes))
+	}
+	var keep []int
+	for i := range t.Fixes {
+		if !bad[i] {
+			keep = append(keep, i)
+		}
+	}
+	for k := 1; k < len(keep); k++ {
+		i := keep[k]
+		prev, cur := t.Fixes[keep[k-1]], t.Fixes[i]
 		dt := cur.Time.Sub(prev.Time)
 		if dt < a.Cfg.MinGapForSpeed || dt > a.Cfg.MaxGap {
 			continue

@@ -29,8 +29,12 @@ so it can be used in scripts. `--json` prints machine-readable output.
 
 The first four are about **physics**: no honest device can produce them. The last two are
 **statistical** and weaker, because real receivers occasionally behave oddly too, so they are never
-reported as high confidence. A single isolated bad fix is treated as a probable receiver glitch
-(low/medium), not as proof of fabrication; repeated outliers are escalated.
+reported as high confidence. A single isolated bad fix is treated as a probable receiver glitch: it is
+reported at low confidence and does **not** change the verdict by itself, and it is kept out of the
+acceleration check (one bad reading corrupts the speeds on both sides of it, which used to make an honest
+drive look "suspicious"). It stops being excused when it is not isolated: repeated outliers escalate, a
+two-fix excursion is not a glitch, and if more than about 1% of the fixes look like isolated outliers the
+trace is treated as tampered with, not glitchy (a zig-zag of displaced fixes would otherwise be absorbed).
 
 ## What it can and cannot catch
 
@@ -78,6 +82,9 @@ about real devices; validating against recorded real-world traces is the main op
   element length, NaN/Inf, hex floats, Unix-time range) was removed in turn to confirm a test fails.
   Two of the seven were *not* caught at first, because the tests were passing for a different
   reason; the tests were rewritten and re-checked.
+- **Attacking my own fix.** After the glitch fix, I tried to hide real anomalies inside it. A zig-zag
+  of 130 displaced fixes was judged *clean* because each one looked like a lone outlier; that is now
+  capped (more than 1% of fixes as "outliers" means tampering), with a regression test.
 - **Evaluation against a simulator** as above, which also caught real problems: the first version
   flagged 87% of honest drives (the simulator was generating impossible acceleration, and the
   acceleration check was reading GPS noise as motion), and a single 300 m GPS glitch was labelled
@@ -123,8 +130,9 @@ RFC 3339 or Unix seconds. GPX `<trkpt>` elements are read; waypoints and routes 
   a flight with the default limit will be called spoofed.
 - Statistical checks need at least 20 fixes and stay silent below that.
 - Validated against a simulator only, not against recorded real traces.
-- The repeated-outlier threshold (5) and the glitch ceiling (200 km) are judgement calls, not
-  derived from data.
+- The repeated-outlier threshold (5), the glitch ceiling (200 km) and the 1% outlier cap are judgement
+  calls, not derived from data. In the simulator honest traces contain no isolated outliers at all
+  (0 in 1,500), but real receivers produce heavy-tailed glitches, so the cap may need tuning on real data.
 - Evaluates one trace at a time; it cannot compare against other people's or devices' traces.
 
 This is a defensive analysis tool. It does not generate or modify location data for use against a
